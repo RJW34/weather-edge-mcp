@@ -1,4 +1,3 @@
-"""Allow running as python -m weather_edge_mcp."""
-from weather_edge_mcp.server import main
-
+"""Run the Weather Edge MCP server."""
+from .server import main
 main()
