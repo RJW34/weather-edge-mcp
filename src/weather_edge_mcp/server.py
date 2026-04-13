@@ -1,367 +1,340 @@
-#!/usr/bin/env python3
-"""Weather Edge MCP Server — Kalshi weather prediction market signals.
+"""Kalshi Weather Edge API v3 — x402 Paid Edition.
 
-Exposes calibrated weather probability data via Model Context Protocol.
-AI agents can query NWS forecasts, GFS ensemble probabilities, blended
-model signals, and real-time settlement station observations.
+AI agents discover via MCP directories, pay per call via x402 micropayments.
+Free: /api/health, /subscribe, / (landing), /dashboard
+Paid: /api/signals, /api/all-signals — $0.01/call USDC on Base
 
-This is the ONLY MCP server providing dual-model (NWS + ensemble)
-calibrated signals for Kalshi weather markets.
-
-Run:
-    python mcp_servers/weather_edge_server.py                    # stdio (for Claude Desktop/Cursor)
-    python mcp_servers/weather_edge_server.py --transport sse     # SSE (for web clients)
-    python mcp_servers/weather_edge_server.py --transport streamable-http  # HTTP
-
-Configure in Claude Desktop (claude_desktop_config.json):
-    {
-      "mcpServers": {
-        "weather-edge": {
-          "command": "python",
-          "args": ["/path/to/mcp_servers/weather_edge_server.py"]
-        }
-      }
-    }
+Run: uvicorn x402_app:app --host 0.0.0.0 --port 8080
 """
-
 from __future__ import annotations
 
-import sys
+import math
+import os
+import re
+import time
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
-# Add scripts dir for imports
-SCRIPTS_DIR = Path(__file__).resolve().parent.parent / "scripts"
-sys.path.insert(0, str(SCRIPTS_DIR))
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 
-from mcp.server.fastmcp import FastMCP
+import httpx
 
 # ---------------------------------------------------------------------------
-# Server definition
+# x402 Payment Configuration
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="weather-edge",
-    instructions="""Weather Edge — Kalshi prediction market signals.
+WALLET_ADDRESS = os.environ.get("X402_WALLET", "0x1D61dB3cB15472D7aec995Da956A7cDF022a29e7")
+PRICE_PER_CALL = os.environ.get("X402_PRICE", "$0.01")
+NETWORK = os.environ.get("X402_NETWORK", "eip155:84532")  # Base mainnet
+X402_ENABLED = os.environ.get("X402_ENABLED", "1") == "1"
 
-Provides calibrated probability data for Kalshi daily high temperature
-markets across 5 US cities: NYC, Chicago, Denver, Miami, LA.
+x402_middleware_fn = None
 
-Uses two independent forecast models:
-1. NWS gridpoint forecast with per-city bias correction
-2. GFS 31-member ensemble (real probability distribution)
+if X402_ENABLED:
+    try:
+        from x402 import x402ResourceServer
+        from x402.http import HTTPFacilitatorClient
+        from x402.http.middleware.fastapi import payment_middleware
+        from x402.mechanisms.evm.exact import ExactEvmServerScheme
 
-Plus real-time METAR observations from exact Kalshi settlement stations.
+        x402_routes = {
+            "GET /api/signals": {
+                "accepts": {
+                    "scheme": "exact",
+                    "payTo": WALLET_ADDRESS,
+                    "price": PRICE_PER_CALL,
+                    "network": NETWORK,
+                }
+            },
+            "GET /api/all-signals": {
+                "accepts": {
+                    "scheme": "exact",
+                    "payTo": WALLET_ADDRESS,
+                    "price": PRICE_PER_CALL,
+                    "network": NETWORK,
+                }
+            },
+        }
 
-Use get_weather_signals() for edge opportunities on a specific city,
-get_all_signals() for a full scan, get_forecast() for raw forecast data,
-and get_station_observation() for live settlement station temperatures.""",
+        facilitator = HTTPFacilitatorClient()
+        server = x402ResourceServer(facilitator)
+        server.register(NETWORK, ExactEvmServerScheme())
+
+        x402_middleware_fn = payment_middleware(x402_routes, server)
+        print(f"[x402] ACTIVE — {PRICE_PER_CALL}/call to {WALLET_ADDRESS[:12]}... on {NETWORK}")
+    except Exception as e:
+        print(f"[x402] Init failed: {e} — FREE mode")
+        X402_ENABLED = False
+
+if not X402_ENABLED:
+    print("[x402] DISABLED — all endpoints free")
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(
+    title="Kalshi Weather Edge",
+    version="0.3.0",
+    description="Calibrated weather signals for Kalshi prediction markets. x402 micropayments.",
 )
 
+if x402_middleware_fn:
+    @app.middleware("http")
+    async def x402_gate(request: Request, call_next):
+        return await x402_middleware_fn(request, call_next)
 
 # ---------------------------------------------------------------------------
-# Lazy-loaded scanner modules (avoid slow imports at startup)
+# Cache
 # ---------------------------------------------------------------------------
 
-_scanners = {}
+_cache: dict = {}
+CACHE_TTL = 300
 
+def get_cached(key: str):
+    entry = _cache.get(key)
+    if entry and time.time() - entry["ts"] < CACHE_TTL:
+        return entry["data"]
+    return None
 
-def _get_scanners():
-    """Lazy-load the scanner modules on first call."""
-    if not _scanners:
-        from noaa_weather_edge import (
-            CITIES,
-            fetch_kalshi_weather,
-            fetch_nws_forecast,
-            find_edges,
-            estimate_nws_probability,
-        )
-        from ensemble_weather_scanner import (
-            ENSEMBLE_STATIONS,
-            fetch_ensemble_forecasts,
-            compute_ensemble_probability,
-        )
-        from blended_weather_scanner import (
-            scan_blended,
-            blend_probabilities,
-        )
-
-        _scanners["CITIES"] = CITIES
-        _scanners["ENSEMBLE_STATIONS"] = ENSEMBLE_STATIONS
-        _scanners["fetch_nws"] = fetch_nws_forecast
-        _scanners["fetch_kalshi"] = fetch_kalshi_weather
-        _scanners["fetch_ensemble"] = fetch_ensemble_forecasts
-        _scanners["find_edges"] = find_edges
-        _scanners["scan_blended"] = scan_blended
-        _scanners["compute_ensemble_prob"] = compute_ensemble_probability
-        _scanners["estimate_nws_prob"] = estimate_nws_probability
-
-    return _scanners
-
+def set_cached(key: str, data):
+    _cache[key] = {"data": data, "ts": time.time()}
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# City Config (calibrated per audit)
 # ---------------------------------------------------------------------------
 
+CITIES = {
+    "nyc": {"label": "New York City", "station": "Central Park",
+            "nws_office": "OKX", "nws_grid_x": 33, "nws_grid_y": 37,
+            "kalshi_series": "KXHIGHNY", "sigma": 3.0, "forecast_bias": -1.0},
+    "chicago": {"label": "Chicago", "station": "Midway",
+                "nws_office": "LOT", "nws_grid_x": 76, "nws_grid_y": 73,
+                "kalshi_series": "KXHIGHCHI", "sigma": 3.0, "forecast_bias": -0.5},
+    "denver": {"label": "Denver", "station": "Denver",
+               "nws_office": "BOU", "nws_grid_x": 62, "nws_grid_y": 60,
+               "kalshi_series": "KXHIGHDEN", "sigma": 4.0, "forecast_bias": 0.0},
+    "miami": {"label": "Miami", "station": "MIA Airport",
+              "nws_office": "MFL", "nws_grid_x": 75, "nws_grid_y": 54,
+              "kalshi_series": "KXHIGHMIA", "sigma": 3.5, "forecast_bias": -3.0},
+}
 
-@mcp.tool()
-def get_weather_signals(city: str) -> str:
-    """Get edge signals for a specific city's Kalshi weather markets.
+NWS_BASE = "https://api.weather.gov"
+KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
-    Returns the blended model (NWS + ensemble) probability vs market price
-    for each temperature bucket, with confidence classification and net
-    expected value per contract.
+# ---------------------------------------------------------------------------
+# Data Fetching
+# ---------------------------------------------------------------------------
 
-    Args:
-        city: City code — one of: nyc, chicago, denver, miami, la
-    """
-    s = _get_scanners()
-    city = city.lower().strip()
+async def fetch_nws_forecast(city_key: str) -> dict | None:
+    cached = get_cached(f"nws_{city_key}")
+    if cached:
+        return cached
+    cfg = CITIES[city_key]
+    url = f"{NWS_BASE}/gridpoints/{cfg['nws_office']}/{cfg['nws_grid_x']},{cfg['nws_grid_y']}/forecast"
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(url, headers={"User-Agent": "weather-edge-mcp"})
+            if resp.status_code != 200:
+                return None
+            for p in resp.json().get("properties", {}).get("periods", []):
+                if p["isDaytime"]:
+                    result = {"high_f": p["temperature"], "date": p["startTime"][:10], "forecast": p["shortForecast"]}
+                    set_cached(f"nws_{city_key}", result)
+                    return result
+        except Exception:
+            return None
+    return None
 
-    if city not in s["CITIES"]:
-        return f"Unknown city '{city}'. Valid: {', '.join(s['CITIES'].keys())}"
+async def fetch_kalshi_markets(city_key: str) -> list[dict]:
+    cached = get_cached(f"kalshi_{city_key}")
+    if cached:
+        return cached
+    cfg = CITIES[city_key]
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            resp = await client.get(f"{KALSHI_BASE}/markets", params={
+                "series_ticker": cfg["kalshi_series"], "status": "open", "limit": 20})
+            if resp.status_code == 200:
+                markets = resp.json().get("markets", [])
+                set_cached(f"kalshi_{city_key}", markets)
+                return markets
+        except Exception:
+            pass
+    return []
 
-    try:
-        forecasts = s["fetch_nws"](city)
-        kalshi_data = s["fetch_kalshi"](city)
-        ensemble_data = s["fetch_ensemble"](city) if city in s["ENSEMBLE_STATIONS"] else {}
-        signals = s["scan_blended"](forecasts, ensemble_data, kalshi_data, city)
-    except Exception as e:
-        return f"Error scanning {city}: {e}"
+# ---------------------------------------------------------------------------
+# Probability Model
+# ---------------------------------------------------------------------------
 
-    if not signals:
-        return f"No open Kalshi markets found for {city}."
+def ncdf(x: float) -> float:
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
 
-    cfg = s["CITIES"][city]
-    lines = [
-        f"# Weather Edge Signals — {cfg['label']}",
-        f"NWS forecast: {forecasts[0].high_f}°F (adjusted: {forecasts[0].high_f + cfg.get('forecast_bias', 0):.0f}°F)",
-        "",
-    ]
+def compute_probability(nws_high, low_f, high_f, is_over, is_under, sigma=3.0, forecast_bias=0.0):
+    adjusted = nws_high + forecast_bias
+    if is_over and low_f is not None:
+        return 1 - ncdf((low_f - 0.5 - adjusted) / sigma)
+    if is_under and high_f is not None:
+        return ncdf((high_f + 0.5 - adjusted) / sigma)
+    if low_f is not None and high_f is not None:
+        return ncdf((high_f + 0.5 - adjusted) / sigma) - ncdf((low_f - 0.5 - adjusted) / sigma)
+    return 0.0
 
-    # Group by confidence
-    for conf in ["HIGH", "MODERATE", "LOW"]:
-        group = [sig for sig in signals if sig.confidence == conf and sig.net_ev > 0]
-        if not group:
+# ---------------------------------------------------------------------------
+# Signal Computation
+# ---------------------------------------------------------------------------
+
+async def compute_signals(city_key: str) -> dict:
+    cached = get_cached(f"signals_{city_key}")
+    if cached:
+        return cached
+
+    cfg = CITIES[city_key]
+    forecast = await fetch_nws_forecast(city_key)
+    if not forecast:
+        return {"city": city_key, "error": "NWS unavailable", "signals": []}
+
+    markets = await fetch_kalshi_markets(city_key)
+    signals = []
+
+    for m in markets:
+        subtitle = m.get("subtitle", m.get("yes_sub_title", ""))
+        yes_bid = float(m.get("yes_bid_dollars", 0) or 0)
+        yes_ask = float(m.get("yes_ask_dollars", 0) or 0)
+        volume = float(m.get("volume_fp", m.get("volume", 0)) or 0)
+
+        is_over = "or above" in subtitle.lower() or "greater" in m.get("strike_type", "")
+        is_under = "or below" in subtitle.lower()
+        low_f = high_f = None
+        nums = re.findall(r"(\d+)", subtitle)
+        if is_over and nums:
+            low_f = int(nums[0])
+        elif is_under and nums:
+            high_f = int(nums[0])
+        elif len(nums) >= 2:
+            low_f, high_f = int(nums[0]), int(nums[1])
+
+        nws_prob = compute_probability(forecast["high_f"], low_f, high_f, is_over, is_under,
+                                       sigma=cfg["sigma"], forecast_bias=cfg["forecast_bias"])
+        mid_price = (yes_bid + yes_ask) / 2 if yes_ask > 0 else yes_bid
+        if mid_price <= 0:
             continue
-        lines.append(f"## {conf} Confidence")
-        for sig in group[:5]:
-            label = sig.bucket.subtitle or sig.bucket.ticker
-            lines.append(
-                f"- **{sig.direction} {label}** | "
-                f"NWS: {sig.p_nws:.1%} | Ensemble: {sig.p_ensemble:.1%} | "
-                f"Blended: {sig.p_blended:.1%} | Market: ${sig.market_price:.2f} | "
-                f"Edge: {sig.edge:+.1%} | Net EV: ${sig.net_ev:+.3f}"
-            )
-        lines.append("")
 
-    positive = sum(1 for sig in signals if sig.net_ev > 0)
-    lines.append(f"**Total: {positive} positive EV signals out of {len(signals)} markets**")
+        edge = nws_prob - mid_price
+        fee = 0.07 * mid_price * (1 - mid_price)
+        net_ev = nws_prob * (1 - yes_ask) - (1 - nws_prob) * yes_ask - fee if yes_ask > 0 else 0
+        verdict = "STRONG" if net_ev > 0.05 else ("GOOD" if net_ev > 0.02 else ("marginal" if net_ev > 0 else ""))
 
-    return "\n".join(lines)
+        signals.append({
+            "ticker": m.get("ticker", ""),
+            "bucket": subtitle,
+            "date": forecast["date"],
+            "nws_high": forecast["high_f"],
+            "nws_prob": round(nws_prob * 100, 1),
+            "market_price": round(mid_price * 100, 1),
+            "edge": round(edge * 100, 1),
+            "net_ev_cents": round(net_ev * 100, 1),
+            "volume": int(volume),
+            "yes_bid": yes_bid,
+            "yes_ask": yes_ask,
+            "verdict": verdict,
+        })
 
-
-@mcp.tool()
-def get_all_signals() -> str:
-    """Scan ALL cities for Kalshi weather edge opportunities.
-
-    Returns the top signals across NYC, Chicago, Denver, Miami, and LA,
-    sorted by confidence and net expected value.
-    """
-    s = _get_scanners()
-    all_signals = []
-    forecast_summary = []
-
-    for city_key in s["CITIES"]:
-        try:
-            forecasts = s["fetch_nws"](city_key)
-            kalshi_data = s["fetch_kalshi"](city_key)
-            ensemble_data = s["fetch_ensemble"](city_key) if city_key in s["ENSEMBLE_STATIONS"] else {}
-            signals = s["scan_blended"](forecasts, ensemble_data, kalshi_data, city_key)
-            all_signals.extend(signals)
-
-            cfg = s["CITIES"][city_key]
-            adj = forecasts[0].high_f + cfg.get("forecast_bias", 0)
-            forecast_summary.append(
-                f"- **{cfg['label']}**: {forecasts[0].high_f}°F (adj: {adj:.0f}°F) — {forecasts[0].short_forecast}"
-            )
-        except Exception as e:
-            forecast_summary.append(f"- **{city_key}**: Error — {e}")
-
-    # Sort by confidence then net_ev
-    conf_order = {"HIGH": 0, "MODERATE": 1, "LOW": 2, "CONFLICT": 3, "NEGATIVE": 4}
-    all_signals.sort(key=lambda sig: (conf_order.get(sig.confidence, 9), -sig.net_ev))
-
-    lines = ["# Weather Edge — Full Scan (All Cities)", ""]
-    lines.append("## Forecasts")
-    lines.extend(forecast_summary)
-    lines.append("")
-
-    positive = [sig for sig in all_signals if sig.net_ev > 0]
-    lines.append(f"## Top Signals ({len(positive)} positive EV)")
-
-    for sig in positive[:15]:
-        label = sig.bucket.subtitle or sig.bucket.ticker
-        city_label = s["CITIES"][sig.city]["label"].split("(")[0].strip()
-        lines.append(
-            f"- [{sig.confidence}] **{sig.direction} {city_label} — {label}** | "
-            f"Blended: {sig.p_blended:.1%} vs Market: ${sig.market_price:.2f} | "
-            f"Edge: {sig.edge:+.1%} | Net EV: ${sig.net_ev:+.3f}"
-        )
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def get_forecast(city: str) -> str:
-    """Get detailed weather forecast for a city — NWS + GFS ensemble.
-
-    Returns the NWS gridpoint forecast (with bias correction) and the
-    GFS 31-member ensemble distribution for the next 2-3 days.
-
-    Args:
-        city: City code — one of: nyc, chicago, denver, miami, la
-    """
-    s = _get_scanners()
-    city = city.lower().strip()
-
-    if city not in s["CITIES"]:
-        return f"Unknown city '{city}'. Valid: {', '.join(s['CITIES'].keys())}"
-
-    cfg = s["CITIES"][city]
-    lines = [f"# Forecast — {cfg['label']}", ""]
-
-    # NWS forecast
-    try:
-        forecasts = s["fetch_nws"](city)
-        bias = cfg.get("forecast_bias", 0)
-        sigma = cfg.get("sigma", 3.0)
-        lines.append(f"## NWS Gridpoint Forecast (bias: {bias:+.1f}°F, σ: {sigma}°F)")
-        for fc in forecasts[:4]:
-            adj = fc.high_f + bias
-            lines.append(f"- **{fc.date}**: {fc.high_f}°F (adjusted: {adj:.0f}°F) — {fc.short_forecast}")
-        lines.append("")
-    except Exception as e:
-        lines.append(f"NWS fetch failed: {e}\n")
-
-    # Ensemble forecast
-    if city in s["ENSEMBLE_STATIONS"]:
-        try:
-            ensemble_data = s["fetch_ensemble"](city)
-            lines.append("## GFS 31-Member Ensemble")
-            for date_str, highs in sorted(ensemble_data.items())[:4]:
-                mean = sum(highs) / len(highs)
-                spread = max(highs) - min(highs)
-                lines.append(
-                    f"- **{date_str}**: mean={mean:.1f}°F "
-                    f"[{min(highs):.0f}–{max(highs):.0f}°F] "
-                    f"spread={spread:.0f}°F ({len(highs)} members)"
-                )
-
-                # Key thresholds
-                thresholds = []
-                for t in range(40, 100, 2):
-                    above = sum(1 for h in highs if h >= t)
-                    pct = above / len(highs) * 100
-                    if 5 < pct < 95:
-                        thresholds.append(f"P(≥{t}°F)={pct:.0f}%")
-                if thresholds:
-                    lines.append(f"  Probabilities: {', '.join(thresholds[:6])}")
-
-            lines.append("")
-        except Exception as e:
-            lines.append(f"Ensemble fetch failed: {e}\n")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def get_station_observation(city: str) -> str:
-    """Get real-time METAR observation from the Kalshi settlement station.
-
-    Returns the current temperature from the EXACT ASOS station that
-    Kalshi uses for settlement, plus trend analysis and whether the
-    daily high appears to be locked in.
-
-    Args:
-        city: City code — one of: nyc, chicago, denver, miami, la
-    """
-    try:
-        from weather_intraday_monitor import get_station_snapshot, METAR_STATIONS
-    except ImportError:
-        return "Intraday monitor module not available."
-
-    city = city.lower().strip()
-    if city not in METAR_STATIONS:
-        return f"Unknown city '{city}'. Valid: {', '.join(METAR_STATIONS.keys())}"
-
-    try:
-        snap = get_station_snapshot(city)
-    except Exception as e:
-        return f"Failed to get station data for {city}: {e}"
-
-    if not snap:
-        return f"No data available for {city}."
-
-    lines = [
-        f"# Station Observation — {snap.station_name} ({snap.icao})",
-        "",
-        f"- **Current temp:** {snap.current_temp_f:.1f}°F",
-        f"- **Observation time:** {snap.current_time_utc}",
-        f"- **Local hour:** ~{snap.local_hour}:00",
-        f"- **Temperature trend:** {snap.temp_trend}",
-        f"- **Daylight remaining:** {snap.hours_of_daylight_remaining:.1f} hours",
-    ]
-
-    if snap.nws_forecast_f:
-        lines.append(f"- **NWS forecast high:** {snap.nws_forecast_f}°F (adjusted: {snap.nws_adjusted_f:.0f}°F)")
-        diff = snap.current_temp_f - snap.nws_adjusted_f
-        lines.append(f"- **Current vs forecast:** {diff:+.0f}°F")
-
-    if snap.high_locked_in:
-        lines.append("")
-        lines.append("**⚠️ DAILY HIGH APPEARS LOCKED IN** — peak likely passed.")
-
-    lines.append("")
-    lines.append(f"*{snap.confidence_note}*")
-
-    return "\n".join(lines)
-
-
-@mcp.tool()
-def list_cities() -> str:
-    """List all available cities with their settlement stations and calibration data."""
-    s = _get_scanners()
-    lines = ["# Available Cities", ""]
-    for key, cfg in s["CITIES"].items():
-        lines.append(
-            f"- **{key}** — {cfg['label']} | "
-            f"σ={cfg.get('sigma', 3.0)}°F | "
-            f"bias={cfg.get('forecast_bias', 0):+.1f}°F | "
-            f"series={cfg['kalshi_series']}"
-        )
-    return "\n".join(lines)
-
+    signals.sort(key=lambda s: s["net_ev_cents"], reverse=True)
+    result = {
+        "city": city_key, "city_label": cfg["label"], "station": cfg["station"],
+        "forecast": forecast, "signals": signals,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    set_cached(f"signals_{city_key}", result)
+    return result
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Metrics
 # ---------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    import argparse
+_metrics = {"total_calls": 0, "paid_calls": 0, "free_calls": 0, "started_at": datetime.now(timezone.utc).isoformat()}
 
-    parser = argparse.ArgumentParser(description="Weather Edge MCP Server")
-    parser.add_argument(
-        "--transport",
-        choices=["stdio", "sse", "streamable-http"],
-        default="stdio",
-        help="Transport mode (default: stdio for Claude Desktop)",
+def track_call(paid=False):
+    _metrics["total_calls"] += 1
+    _metrics["paid_calls" if paid else "free_calls"] += 1
+
+# ---------------------------------------------------------------------------
+# FREE Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/", response_class=HTMLResponse)
+async def home():
+    return HTMLResponse(
+        "<h1>Kalshi Weather Edge</h1>"
+        "<p>Calibrated weather prediction signals for Kalshi markets.</p>"
+        "<p>Powered by x402 micropayments — AI agents pay $0.01/call in USDC.</p>"
+        "<p><a href='/api/health'>Health</a> | <a href='/subscribe'>Subscribe</a> | <a href='/dashboard'>Dashboard</a> | <a href='/docs'>API Docs</a></p>"
     )
-    parser.add_argument("--port", type=int, default=8050, help="Port for SSE/HTTP transport")
-    args = parser.parse_args()
 
-    if args.transport == "stdio":
-        mcp.run(transport="stdio")
-    elif args.transport == "sse":
-        mcp.run(transport="sse", port=args.port)
-    elif args.transport == "streamable-http":
-        mcp.run(transport="streamable-http", port=args.port)
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok", "version": "0.3.0",
+        "x402_enabled": X402_ENABLED,
+        "price": PRICE_PER_CALL if X402_ENABLED else "free",
+        "network": NETWORK if X402_ENABLED else None,
+        "wallet": WALLET_ADDRESS[:12] + "..." if X402_ENABLED else None,
+        "cities": list(CITIES.keys()),
+        "cache_ttl": CACHE_TTL,
+        "metrics": _metrics,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+@app.get("/subscribe")
+async def subscribe():
+    return {
+        "protocol": "x402",
+        "price": PRICE_PER_CALL,
+        "network": NETWORK,
+        "wallet": WALLET_ADDRESS,
+        "endpoints": {
+            "/api/signals?city=nyc": "Signals for one city ($0.01)",
+            "/api/all-signals": "All cities ($0.01)",
+        },
+        "free": ["/", "/api/health", "/subscribe", "/dashboard", "/docs"],
+        "how_to_pay": "AI agents with x402-compatible clients handle payment automatically via the x-payment header.",
+    }
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    summary = []
+    for ck in CITIES:
+        try:
+            data = await compute_signals(ck)
+            strong = len([s for s in data.get("signals", []) if s.get("verdict") == "STRONG"])
+            summary.append(f"<li><b>{CITIES[ck]['label']}</b>: {strong} STRONG / {len(data.get('signals', []))} total</li>")
+        except Exception:
+            summary.append(f"<li><b>{CITIES[ck]['label']}</b>: error</li>")
+    return HTMLResponse(
+        "<h1>Weather Edge Dashboard</h1>"
+        "<p>Signal summary (full details via paid API):</p>"
+        f"<ul>{''.join(summary)}</ul>"
+        "<p><a href='/subscribe'>x402 Payment Info</a> | <a href='/docs'>API Docs</a></p>"
+    )
+
+# ---------------------------------------------------------------------------
+# PAID Routes (x402 gated)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/signals")
+async def api_signals(city: str = "nyc"):
+    track_call(paid=X402_ENABLED)
+    if city not in CITIES:
+        return JSONResponse({"error": f"Unknown city: {city}", "available": list(CITIES.keys())}, status_code=400)
+    return JSONResponse(await compute_signals(city))
+
+@app.get("/api/all-signals")
+async def api_all_signals():
+    track_call(paid=X402_ENABLED)
+    results = {}
+    for ck in CITIES:
+        results[ck] = await compute_signals(ck)
+    return JSONResponse(results)
