@@ -1,5 +1,7 @@
 # Weather Edge MCP Server
 
+[![weather-edge-mcp MCP server](https://glama.ai/mcp/servers/RJW34/weather-edge-mcp/badges/card.svg)](https://glama.ai/mcp/servers/RJW34/weather-edge-mcp)
+
 Calibrated weather probability signals for [Kalshi](https://kalshi.com) prediction markets.
 
 The **only MCP server** for weather prediction market intelligence. Uses dual-model forecasting (NWS + GFS ensemble) to find mispriced temperature markets.

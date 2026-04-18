@@ -22,12 +22,16 @@ classifiers = [
 dependencies = [
     "mcp>=1.0.0",
     "httpx>=0.24.0",
+    "fastapi>=0.115.0",
     "pandas-ta>=0.3.14b",
 ]
 
 [project.urls]
 Homepage = "https://github.com/RJW34/weather-edge-mcp"
 Issues = "https://github.com/RJW34/weather-edge-mcp/issues"
+
+[project.scripts]
+weather-edge-mcp = "weather_edge_mcp.server:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/weather_edge_mcp"]

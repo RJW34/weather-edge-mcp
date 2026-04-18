@@ -8,6 +8,8 @@ Run: uvicorn x402_app:app --host 0.0.0.0 --port 8080
 """
 from __future__ import annotations
 
+import argparse
+import asyncio
 import math
 import os
 import re
@@ -18,6 +20,7 @@ from typing import Optional
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
+from mcp.server.fastmcp import FastMCP
 
 import httpx
 
@@ -107,22 +110,36 @@ def set_cached(key: str, data):
 # ---------------------------------------------------------------------------
 
 CITIES = {
-    "nyc": {"label": "New York City", "station": "Central Park",
+    "nyc": {"label": "New York City", "station": "Central Park", "metar_station": "KNYC",
             "nws_office": "OKX", "nws_grid_x": 33, "nws_grid_y": 37,
             "kalshi_series": "KXHIGHNY", "sigma": 3.0, "forecast_bias": -1.0},
-    "chicago": {"label": "Chicago", "station": "Midway",
+    "chicago": {"label": "Chicago", "station": "Midway", "metar_station": "KMDW",
                 "nws_office": "LOT", "nws_grid_x": 76, "nws_grid_y": 73,
                 "kalshi_series": "KXHIGHCHI", "sigma": 3.0, "forecast_bias": -0.5},
-    "denver": {"label": "Denver", "station": "Denver",
+    "denver": {"label": "Denver", "station": "Denver", "metar_station": "KDEN",
                "nws_office": "BOU", "nws_grid_x": 62, "nws_grid_y": 60,
                "kalshi_series": "KXHIGHDEN", "sigma": 4.0, "forecast_bias": 0.0},
-    "miami": {"label": "Miami", "station": "MIA Airport",
+    "miami": {"label": "Miami", "station": "MIA Airport", "metar_station": "KMIA",
               "nws_office": "MFL", "nws_grid_x": 75, "nws_grid_y": 54,
               "kalshi_series": "KXHIGHMIA", "sigma": 3.5, "forecast_bias": -3.0},
+    "la": {"label": "Los Angeles", "station": "Los Angeles Downtown", "metar_station": "KLAX",
+            "nws_office": "LOX", "nws_grid_x": 154, "nws_grid_y": 44,
+            "kalshi_series": "HIGHLA", "sigma": 3.5, "forecast_bias": 0.0},
 }
 
 NWS_BASE = "https://api.weather.gov"
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
+AVIATION_WEATHER_BASE = "https://aviationweather.gov/api/data/metar"
+
+mcp = FastMCP(
+    name="weather-edge",
+    instructions=(
+        "Weather Edge MCP Server for calibrated Kalshi weather-market intelligence. "
+        "Use list_cities for supported markets, get_weather_signals for one city, "
+        "get_all_signals for a full scan, get_forecast for raw forecast context, and "
+        "get_station_observation for live settlement-station readings."
+    ),
+)
 
 # ---------------------------------------------------------------------------
 # Data Fetching
@@ -251,6 +268,133 @@ async def compute_signals(city_key: str) -> dict:
     set_cached(f"signals_{city_key}", result)
     return result
 
+
+async def fetch_station_observation(city_key: str) -> dict:
+    cached = get_cached(f"station_{city_key}")
+    if cached:
+        return cached
+    cfg = CITIES[city_key]
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(AVIATION_WEATHER_BASE, params={"ids": cfg["metar_station"], "format": "json"})
+        resp.raise_for_status()
+        payload = resp.json()
+        if not payload:
+            raise RuntimeError(f"No METAR observation for {cfg['metar_station']}")
+        obs = payload[0]
+        result = {
+            "city": city_key,
+            "station": cfg["station"],
+            "icao": cfg["metar_station"],
+            "observed_at": obs.get("obsTime") or obs.get("observationTime") or "",
+            "temp_c": obs.get("temp") if obs.get("temp") is not None else obs.get("tempC"),
+            "wind_speed_kt": obs.get("wspd") or obs.get("windSpeed"),
+            "raw": obs.get("rawOb") or obs.get("rawText") or "",
+        }
+        if result["temp_c"] is not None:
+            result["temp_f"] = round((float(result["temp_c"]) * 9 / 5) + 32, 1)
+        else:
+            result["temp_f"] = None
+        set_cached(f"station_{city_key}", result)
+        return result
+
+
+def _run(coro):
+    return asyncio.run(coro)
+
+
+@mcp.tool()
+def get_weather_signals(city: str) -> str:
+    """Get calibrated edge signals for one city's Kalshi weather markets.
+
+    Args:
+        city: One of nyc, chicago, denver, miami, la.
+    """
+    city = city.lower().strip()
+    if city not in CITIES:
+        return f"Unknown city '{city}'. Valid: {', '.join(CITIES.keys())}"
+    data = _run(compute_signals(city))
+    if data.get("error"):
+        return f"Error: {data['error']}"
+    lines = [f"# Weather Edge — {data['city_label']}", f"Station: {data['station']}", ""]
+    fc = data["forecast"]
+    lines.append(f"Forecast: {fc['high_f']}°F — {fc['forecast']}")
+    lines.append("")
+    for sig in data.get("signals", [])[:10]:
+        if not sig.get("verdict"):
+            continue
+        lines.append(
+            f"- [{sig['verdict']}] {sig['bucket']} | NWS {sig['nws_prob']}% vs market {sig['market_price']}% | edge {sig['edge']:+.1f} pts | EV {sig['net_ev_cents']:+.1f}c"
+        )
+    if len(lines) <= 4:
+        lines.append("No positive-EV signals found.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_all_signals() -> str:
+    """Run a full scan across all supported cities and rank top weather-market signals."""
+    summaries = []
+    for city in CITIES:
+        data = _run(compute_signals(city))
+        for sig in data.get("signals", [])[:5]:
+            if sig.get("verdict"):
+                summaries.append((sig["net_ev_cents"], data["city_label"], sig))
+    summaries.sort(key=lambda row: row[0], reverse=True)
+    lines = ["# Weather Edge — Full Scan", ""]
+    for _, city_label, sig in summaries[:15]:
+        lines.append(f"- {city_label}: [{sig['verdict']}] {sig['bucket']} | market {sig['market_price']}% | edge {sig['edge']:+.1f} pts | EV {sig['net_ev_cents']:+.1f}c")
+    if len(lines) == 2:
+        lines.append("No positive-EV signals found across supported cities.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_forecast(city: str) -> str:
+    """Get raw calibrated forecast context for one supported city.
+
+    Args:
+        city: One of nyc, chicago, denver, miami, la.
+    """
+    city = city.lower().strip()
+    if city not in CITIES:
+        return f"Unknown city '{city}'. Valid: {', '.join(CITIES.keys())}"
+    fc = _run(fetch_nws_forecast(city))
+    if not fc:
+        return "Forecast unavailable"
+    cfg = CITIES[city]
+    adjusted = fc['high_f'] + cfg['forecast_bias']
+    return f"# Forecast — {cfg['label']}\n\nRaw NWS high: {fc['high_f']}°F\nBias-adjusted high: {adjusted:.1f}°F\nSigma: {cfg['sigma']}°F\nForecast: {fc['forecast']}\nDate: {fc['date']}"
+
+
+@mcp.tool()
+def get_station_observation(city: str) -> str:
+    """Get the latest METAR observation from the settlement station for one city.
+
+    Args:
+        city: One of nyc, chicago, denver, miami, la.
+    """
+    city = city.lower().strip()
+    if city not in CITIES:
+        return f"Unknown city '{city}'. Valid: {', '.join(CITIES.keys())}"
+    obs = _run(fetch_station_observation(city))
+    return (
+        f"# Station Observation — {CITIES[city]['label']}\n\n"
+        f"Station: {obs['station']} ({obs['icao']})\n"
+        f"Observed at: {obs['observed_at']}\n"
+        f"Temperature: {obs['temp_f']}°F\n"
+        f"Wind: {obs['wind_speed_kt']} kt\n"
+        f"Raw METAR: {obs['raw']}"
+    )
+
+
+@mcp.tool()
+def list_cities() -> str:
+    """List supported cities, settlement stations, and calibration parameters."""
+    lines = ["# Supported Cities", ""]
+    for key, cfg in CITIES.items():
+        lines.append(f"- {key}: {cfg['label']} | station={cfg['station']} | metar={cfg['metar_station']} | sigma={cfg['sigma']} | bias={cfg['forecast_bias']:+.1f}")
+    return "\n".join(lines)
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -338,3 +482,20 @@ async def api_all_signals():
     for ck in CITIES:
         results[ck] = await compute_signals(ck)
     return JSONResponse(results)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Weather Edge MCP Server")
+    parser.add_argument("--transport", choices=["stdio", "sse", "streamable-http"], default="stdio")
+    parser.add_argument("--port", type=int, default=8050)
+    args = parser.parse_args()
+    if args.transport == "stdio":
+        mcp.run(transport="stdio")
+    elif args.transport == "sse":
+        mcp.run(transport="sse", port=args.port)
+    else:
+        mcp.run(transport="streamable-http", port=args.port)
+
+
+if __name__ == "__main__":
+    main()
