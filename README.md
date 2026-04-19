@@ -79,6 +79,15 @@ Routes:
 
 If the optional `x402` stack is installed and configured, the paid routes can be gated there. MCP stdio mode stays clean and side-effect free.
 
+## Docker
+
+The repo includes a Dockerfile for Glama/container builds.
+
+```bash
+docker build -t weather-edge-mcp .
+docker run --rm weather-edge-mcp --help
+```
+
 ## Architecture
 
 ```text

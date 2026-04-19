@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from .core import CACHE_TTL, CITIES, compute_signals
 
 logger = logging.getLogger(__name__)
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 WALLET_ADDRESS = os.environ.get("X402_WALLET", "0x1D61dB3cB15472D7aec995Da956A7cDF022a29e7")
 PRICE_PER_CALL = os.environ.get("X402_PRICE", "$0.01")
 NETWORK = os.environ.get("X402_NETWORK", "eip155:84532")

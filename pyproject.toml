@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "weather-edge-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for calibrated Kalshi weather-market signals."
 readme = "README.md"
 license = "MIT"
