@@ -1,0 +1,14 @@
+{
+  "name": "weather-edge-mcp",
+  "category": "read-only-market-intelligence",
+  "dataSources": ["National Weather Service", "Aviation Weather", "Kalshi public market API"],
+  "sideEffects": "none",
+  "credentialRequirement": "none",
+  "executionBoundary": "no account, order, position, payment, signing, custody, or trading automation",
+  "schemaMonitoring": {
+    "defaultMode": "mocked-offline",
+    "liveNetworkPolicy": "owner-gated/manual-only",
+    "ciPolicy": "mocked fixtures only; no live network calls"
+  }
+}
+

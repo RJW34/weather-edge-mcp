@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "weather-edge": {
+      "command": "python",
+      "args": ["-m", "weather_edge_mcp"]
+    }
+  }
+}
+
